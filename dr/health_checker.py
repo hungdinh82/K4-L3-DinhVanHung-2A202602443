@@ -29,13 +29,67 @@ URL = {"a": "http://127.0.0.1:8001", "b": "http://127.0.0.1:8002"}
 
 
 def probe(region: str, timeout: float) -> tuple[bool, str]:
-    """TODO: trả về (ready, reason). Timeout PHẢI có — netblock làm request treo mãi."""
-    raise NotImplementedError
+    """Return whether a region can serve traffic, with a useful failure reason."""
+    try:
+        response = httpx.get(f"{URL[region]}/readyz", timeout=timeout)
+    except httpx.HTTPError as exc:
+        return False, type(exc).__name__
+
+    if response.status_code == 200:
+        return True, "ready"
+
+    try:
+        detail = response.json().get("reasons")
+    except (ValueError, AttributeError):
+        detail = None
+    return False, f"http_{response.status_code}" + (f":{detail}" if detail else "")
 
 
 def run(interval: float, timeout: float, threshold: int, duration: float, out: pathlib.Path):
-    """TODO: vòng lặp poll + phát hiện transition + ghi JSONL."""
-    raise NotImplementedError
+    """Poll both regions and emit JSONL only when their health state changes."""
+    if interval <= 0:
+        raise ValueError("interval must be positive")
+    if threshold <= 0:
+        raise ValueError("threshold must be positive")
+
+    out.parent.mkdir(parents=True, exist_ok=True)
+    states = {region: "HEALTHY" for region in URL}
+    consecutive_fails = {region: 0 for region in URL}
+    deadline = time.time() + duration
+
+    def emit(region: str, to: str, reason: str):
+        record = {
+            "ts": time.time(),
+            "iso": time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime()),
+            "event": "state_change",
+            "region": region,
+            "to": to,
+            "reason": reason,
+            "consecutive_fails": consecutive_fails[region],
+            "interval_s": interval,
+            "threshold": threshold,
+        }
+        log.write(json.dumps(record) + "\n")
+        log.flush()
+
+    with out.open("a") as log:
+        while time.time() < deadline:
+            poll_started = time.time()
+            for region in URL:
+                ready, reason = probe(region, timeout)
+                if ready:
+                    consecutive_fails[region] = 0
+                    if states[region] == "UNHEALTHY":
+                        states[region] = "HEALTHY"
+                        emit(region, "HEALTHY", reason)
+                else:
+                    consecutive_fails[region] += 1
+                    if (states[region] == "HEALTHY"
+                            and consecutive_fails[region] >= threshold):
+                        states[region] = "UNHEALTHY"
+                        emit(region, "UNHEALTHY", reason)
+
+            time.sleep(max(0.0, interval - (time.time() - poll_started)))
 
 
 if __name__ == "__main__":
